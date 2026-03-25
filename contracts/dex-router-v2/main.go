@@ -137,6 +137,8 @@ func RegisterPool(payload *string) *string {
 	}
 	setStr(poolKey, params.DexContractId)
 
+	sdk.Log("reg_pool|a0=" + params.Asset0 + "|a1=" + params.Asset1 + "|pool=" + params.DexContractId)
+
 	return nil
 }
 
