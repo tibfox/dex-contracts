@@ -327,6 +327,14 @@ func Swap(payload *string) *string {
 				ce.NewContractError(ce.ErrInitialization, "invalid minimum amount out"),
 			)
 		}
+		// review7 M2: SetString parses a negative value fine, and a negative
+		// floor makes the Cmp check below vacuously pass — defeating slippage
+		// protection entirely. Reject it.
+		if minOut.Sign() < 0 {
+			ce.CustomAbort(
+				ce.NewContractError(ce.ErrInput, "minimum amount out must be non-negative"),
+			)
+		}
 		if amountOut.Cmp(minOut) < 0 {
 			ce.CustomAbort(
 				ce.NewContractError(ce.ErrInitialization, "slippage tolerance exceeded"),

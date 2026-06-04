@@ -38,6 +38,12 @@ func getBigInt(key string) *big.Int {
 }
 
 func setBigInt(key string, val *big.Int) {
+	// review7 M6: big.Int.Bytes() encodes magnitude only, so a negative value
+	// would round-trip through getBigInt as its absolute value — silent state
+	// corruption (a negative reserve/fee/LP becomes positive). Every value this
+	// pool stores is non-negative by invariant; assert it so a future negative
+	// write aborts loudly instead of corrupting the pool.
+	contractAssert(val.Sign() >= 0, "setBigInt: negative value for "+key)
 	sdk.StateSetObject(key, string(val.Bytes()))
 }
 

@@ -522,6 +522,19 @@ func executeTwoHopSwap(instruction types.DexInstruction) *string {
 func settleToChain(asset string, amount *big.Int, toAddress string, chain string, maxFee *int64) {
 	assetLower := strings.ToLower(asset)
 
+	// review7 M4: the destination chain was ignored — settlement routed purely
+	// by asset, so destination_chain:"BTC" with a HIVE asset/recipient still
+	// HiveWithdrew to Hive (and vice versa), sending funds somewhere the caller
+	// did not intend. If a chain is specified it must match the asset's
+	// registered chain.
+	if chain != "" {
+		assetChain := getAssetChain(assetLower)
+		if assetChain != "" && !strings.EqualFold(chain, assetChain) {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput,
+				"destination chain "+chain+" does not match asset "+asset+" (registered chain "+assetChain+")"))
+		}
+	}
+
 	if assetLower == "hive" || assetLower == "hbd" {
 		sdk.HiveWithdraw(sdk.Address(toAddress), amount, sdk.Asset(assetLower))
 		return
