@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tinyjson "github.com/CosmWasm/tinyjson"
+	ce "github.com/vsc-eco/dex-contracts/contracterrors"
 	"github.com/vsc-eco/dex-contracts/contracts/types"
 	"github.com/vsc-eco/dex-contracts/sdk"
 )
@@ -154,7 +155,11 @@ func getMappingContract(asset string) string {
 	var tokenInfo types.TokenInfo
 	err := tinyjson.Unmarshal([]byte(infoStr), &tokenInfo)
 	if err != nil {
-		return ""
+		// review7 M8: a registry entry EXISTS but is corrupted. Returning ""
+		// here would make a mapped asset look native, so settleToChain would
+		// HiveWithdraw it instead of unmapping — misrouting funds silently.
+		// Abort instead so the failure is loud and no funds move.
+		ce.CustomAbort(ce.WrapContractError(ce.ErrJson, err, "corrupted token registry entry for asset "+asset))
 	}
 	return tokenInfo.MappingContract
 }

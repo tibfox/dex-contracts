@@ -51,6 +51,22 @@ func EphemStateDeleteObject(key string) {
 }
 
 // Get current execution environment variables
+// envAddrList converts an untyped env value into []Address, tolerating a
+// missing key or a wrong element type instead of panicking (review7 M18).
+func envAddrList(v interface{}) []Address {
+	out := make([]Address, 0)
+	list, ok := v.([]interface{})
+	if !ok {
+		return out
+	}
+	for _, item := range list {
+		if s, ok := item.(string); ok {
+			out = append(out, Address(s))
+		}
+	}
+	return out
+}
+
 func GetEnv() Env {
 	envStr := *getEnv(nil)
 	env := Env{}
@@ -59,19 +75,17 @@ func GetEnv() Env {
 	envMap := EnvMap{}
 	tinyjson.Unmarshal([]byte(envStr), &envMap)
 
-	requiredAuths := make([]Address, 0)
-	for _, auth := range envMap["msg.required_auths"].([]interface{}) {
-		addr := auth.(string)
-		requiredAuths = append(requiredAuths, Address(addr))
-	}
-	requiredPostingAuths := make([]Address, 0)
-	for _, auth := range envMap["msg.required_posting_auths"].([]interface{}) {
-		addr := auth.(string)
-		requiredPostingAuths = append(requiredPostingAuths, Address(addr))
-	}
+	// review7 M18: bare type assertions here panicked (trapping the whole
+	// contract — a DoS) if any env field was absent or the wrong type. Use
+	// comma-ok and fail CLOSED: a malformed env yields empty auths / empty
+	// sender, so auth-gated entrypoints deny rather than crash, while read-only
+	// entrypoints keep working.
+	requiredAuths := envAddrList(envMap["msg.required_auths"])
+	requiredPostingAuths := envAddrList(envMap["msg.required_posting_auths"])
 
+	sender, _ := envMap["msg.sender"].(string)
 	env.Sender = Sender{
-		Address:              Address(envMap["msg.sender"].(string)),
+		Address:              Address(sender),
 		RequiredAuths:        requiredAuths,
 		RequiredPostingAuths: requiredPostingAuths,
 	}
