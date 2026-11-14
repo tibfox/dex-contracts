@@ -34,19 +34,35 @@ const (
 	hbdPoolLiq   = 100_000_000     // 100k HBD (3 decimals)
 	usdcRcLimit  = 20_000
 	evmBridgeEnv = "EVM_BRIDGE_WASM"
-	usdcOwner    = "hive:milo-hpr"
-	usdcRouter   = "vsc1Bpc3SgDqCRQxzeDrvV7T4XKV6BZuHmME5F"
+	// evmBridgeSkip is the explicit opt-out: a missing artifact otherwise fails.
+	evmBridgeSkip = "skip"
+	usdcOwner     = "hive:milo-hpr"
+	usdcRouter    = "vsc1Bpc3SgDqCRQxzeDrvV7T4XKV6BZuHmME5F"
 )
 
+// evmBridgeWasm loads the real EVM bridge wasm these tests run against.
+//
+// A MISSING ARTIFACT FAILS, it does not skip. The default path below is one
+// developer's checkout, so on every other machine — and in CI — a skip here
+// turned the whole file, and every later test that needs the bridge (the
+// settlement-refund test in return_address_test.go among them), into a silent
+// no-op that still reported ok. A change nobody tested read as a change that
+// passed. Set EVM_BRIDGE_WASM to the bridge build, or EVM_BRIDGE_WASM=skip to
+// skip these deliberately and knowingly.
 func evmBridgeWasm(t *testing.T) []byte {
 	t.Helper()
 	path := os.Getenv(evmBridgeEnv)
+	if path == evmBridgeSkip {
+		t.Skipf("%s=%s: skipping the tests that need the real EVM bridge wasm", evmBridgeEnv, evmBridgeSkip)
+	}
 	if path == "" {
 		path = os.ExpandEnv("$HOME/evm-fix/gvn-parity-devnet/.devnet/evm-artifacts-parity/evm-bridge.wasm")
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		t.Skipf("EVM bridge wasm not available (%s): %v", path, err)
+		t.Fatalf("EVM bridge wasm not available (%s): %v\n"+
+			"These tests run against the real bridge build. Point %s at it, "+
+			"or set %s=%s to skip them on purpose.", path, err, evmBridgeEnv, evmBridgeEnv, evmBridgeSkip)
 	}
 	return b
 }
