@@ -426,7 +426,7 @@ func executeDirectSwap(dexContractId string, instruction types.DexInstruction) *
 			instruction.Recipient,
 			instruction.DestinationChain,
 			instruction.MaxFee,
-			userAddr,
+			settlementRefundTo(instruction, userAddr),
 		)
 	}
 
@@ -549,11 +549,32 @@ func executeTwoHopSwap(instruction types.DexInstruction) *string {
 			instruction.Recipient,
 			instruction.DestinationChain,
 			instruction.MaxFee,
-			userAddr,
+			settlementRefundTo(instruction, userAddr),
 		)
 	}
 
 	return secondResult
+}
+
+// settlementRefundTo is who gets a settlement back if the payout fails after the
+// swap (an EVM withdrawal whose L1 receipt fails). By default the router's caller,
+// which is right for a user calling directly. A contract calling for someone else
+// (a mapping contract running a deposit swap) names that sender in
+// return_address {chain: "MAGI", address: <user account>}; otherwise the refund
+// would land on the calling contract, where nobody can move it.
+func settlementRefundTo(instruction types.DexInstruction, caller string) string {
+	ra := instruction.ReturnAddress
+	if ra == nil || ra.Address == "" {
+		return caller
+	}
+	if c := strings.ToUpper(ra.Chain); c != "" && c != chainMAGI {
+		return caller
+	}
+	if !strings.HasPrefix(sdk.VerifyAddress(ra.Address), "user:") {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput,
+			"return_address "+ra.Address+" is not a user account"))
+	}
+	return ra.Address
 }
 
 // settleToChain bridges swap output to an external chain.
