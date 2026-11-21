@@ -245,33 +245,13 @@ func Execute(payload *string) *string {
 		ce.CustomAbort(ce.WrapContractError(ce.ErrJson, err, "invalid payload"))
 	}
 
-	// Common validation
-	if instruction.Type == "" || instruction.Version == "" || instruction.Recipient == "" {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "type, version, and recipient are required"))
+	// A swap paid from a Hive account that wants a failure back on Hive: from
+	// here on it either completes or goes back to Hive (executeHiveReturnSwap).
+	if instruction.Type == "swap" && returnsToHive(instruction.ReturnAddress) {
+		return executeHiveReturnSwap(instruction, env.Caller.String())
 	}
 
-	// Reject any instruction that routes output / LP shares back to THIS router
-	// contract. Tokens transferred to the router's own account have no recovery
-	// export and would be permanently stranded (DX-L07). Use the live
-	// env.ContractId so the guard stays correct across any re-deployment.
-	// Applies to all instruction types: a swap output, a deposit's LP shares,
-	// or a withdrawal's recipient set to the router are all unrecoverable.
-	if instruction.Recipient == "contract:"+env.ContractId {
-		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "recipient cannot be the router contract itself"))
-	}
-
-	// Normalize destination chain
-	instruction.DestinationChain = strings.ToUpper(instruction.DestinationChain)
-
-	// When settling on an external chain, Recipient is an address on that chain
-	// (e.g. a Hive username or BTC address) and cannot be validated as a Magi address.
-	// Only validate as Magi address when there is no cross-chain destination.
-	if instruction.DestinationChain == "" || instruction.DestinationChain == chainMAGI {
-		if sdk.VerifyAddress(instruction.Recipient) == "unknown" {
-			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "recipient address ["+instruction.Recipient+"] invalid"))
-		}
-		instruction.DestinationChain = "" // normalize MAGI to empty (default)
-	}
+	validateInstruction(&instruction, env.ContractId)
 
 	switch instruction.Type {
 	case "swap":
@@ -279,7 +259,9 @@ func Execute(payload *string) *string {
 		if instruction.AssetIn == "" || instruction.AssetOut == "" {
 			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "swap requires asset_in and asset_out"))
 		}
-		return executeSwap(instruction)
+		caller := env.Caller.String()
+		refundTo, returnAsset := settlementReturn(instruction, caller)
+		return executeSwap(instruction, swapCtx{user: caller, refundTo: refundTo, returnAsset: returnAsset})
 
 	case "deposit":
 		// Deposit uses pool-ordered asset0/asset1
@@ -319,8 +301,145 @@ func Execute(payload *string) *string {
 	}
 }
 
+// validateInstruction is the checks every instruction passes before it runs.
+func validateInstruction(instruction *types.DexInstruction, routerId string) {
+	// Common validation
+	if instruction.Type == "" || instruction.Version == "" || instruction.Recipient == "" {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "type, version, and recipient are required"))
+	}
+
+	// Reject any instruction that routes output / LP shares back to THIS router
+	// contract. Tokens transferred to the router's own account have no recovery
+	// export and would be permanently stranded (DX-L07). Use the live
+	// env.ContractId so the guard stays correct across any re-deployment.
+	// Applies to all instruction types: a swap output, a deposit's LP shares,
+	// or a withdrawal's recipient set to the router are all unrecoverable.
+	if instruction.Recipient == "contract:"+routerId {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "recipient cannot be the router contract itself"))
+	}
+
+	// Normalize destination chain
+	instruction.DestinationChain = strings.ToUpper(instruction.DestinationChain)
+
+	// When settling on an external chain, Recipient is an address on that chain
+	// (e.g. a Hive username or BTC address) and cannot be validated as a Magi address.
+	// Only validate as Magi address when there is no cross-chain destination.
+	if instruction.DestinationChain == "" || instruction.DestinationChain == chainMAGI {
+		if sdk.VerifyAddress(instruction.Recipient) == "unknown" {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "recipient address ["+instruction.Recipient+"] invalid"))
+		}
+		instruction.DestinationChain = "" // normalize MAGI to empty (default)
+	}
+}
+
+// swapCtx is who a swap is for and where its input is.
+type swapCtx struct {
+	user        string // the trader: the pools' From
+	refundTo    string // who gets a payout that fails after the swap (an EVM withdrawal) back
+	drawn       bool   // the input is already on the router (swap_drawn)
+	returnAsset string // drawn: the Hive asset a payout that reverts later is swapped back to
+}
+
+// returnsToHive reports whether return_address asks for a failed swap's input
+// back on Hive.
+func returnsToHive(ra *types.ReturnAddress) bool {
+	return ra != nil && strings.EqualFold(strings.TrimSpace(ra.Chain), chainHIVE)
+}
+
+// executeHiveReturnSwap runs a swap paid from a Hive account (return_address
+// {chain: "HIVE", address: <hive account>}) so that it either completes or its
+// input goes back to that account on Hive, never staying in a Magi balance.
+//
+// A HIVE/HBD transfer to the gateway is credited to the sender's Magi balance
+// when the node reads the Hive block, apart from the call in the same
+// transaction: a call that aborts reverts only itself, and the deposit stays
+// on Magi. So the router draws the input first, runs the whole swap and its
+// payout in a call to itself in try mode (every effect of a failure is rolled
+// back, as for the mapping contracts' deposit swaps), and on any failure
+// withdraws the input to the Hive account. This is THORChain's refundTx: a
+// swap that does not complete goes back to its sender on its own chain.
+//
+// What can still leave the input on Magi: a draw that fails (the transfer.allow
+// intent below amount_in, or the balance short) and a call that runs out of RC.
+// Both happen before anything moves.
+func executeHiveReturnSwap(instruction types.DexInstruction, caller string) *string {
+	asset := strings.ToLower(instruction.AssetIn)
+	if asset != sdk.AssetHive.String() && asset != sdk.AssetHbd.String() {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "return_address on HIVE needs a HIVE or HBD input"))
+	}
+	to := strings.TrimSpace(instruction.ReturnAddress.Address)
+	if to != "" && !strings.Contains(to, ":") {
+		to = "hive:" + to
+	}
+	if sdk.VerifyAddress(to) != "user:hive" {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "return_address "+to+" is not a Hive account"))
+	}
+	amount, ok := new(big.Int).SetString(instruction.AmountIn, 10)
+	if !ok || amount.Sign() <= 0 {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "amount_in must be positive"))
+	}
+	sdk.HiveDraw(amount, sdk.Asset(asset))
+
+	env := sdk.GetEnv()
+	inner := instruction
+	inner.ReturnAddress = nil
+	payload, err := tinyjson.Marshal(&types.DrawnSwap{Instruction: inner, User: caller, RefundTo: to})
+	if err != nil {
+		ce.CustomAbort(ce.WrapContractError(ce.ErrJson, err, "failed to marshal the swap"))
+	}
+	res := sdk.TryContractCall(env.ContractId, "swap_drawn", string(payload), nil)
+	if res.Ok {
+		return &res.Result
+	}
+	sdk.HiveWithdraw(sdk.Address(to), amount, sdk.Asset(asset))
+	sdk.Log("swaprefund|t=" + to + "|a=" + asset + "|d=" + amount.String() + "|why=" + logSafe(res.Error))
+	out := `{"amount_out":"0","refunded":"` + amount.String() + `","asset":"` + asset + `","to":"` + to + `"}`
+	return &out
+}
+
+// SwapDrawn is executeHiveReturnSwap's call to the router itself: the swap and
+// its payout, with the input already on the router. Only the router may call
+// it; any abort here is rolled back and the input goes back to Hive.
+//
+//go:wasmexport swap_drawn
+func SwapDrawn(payload *string) *string {
+	env := sdk.GetEnv()
+	if env.Caller.String() != "contract:"+env.ContractId {
+		ce.CustomAbort(ce.NewContractError(ce.ErrNoPermission, "swap_drawn is the router's own call"))
+	}
+	if payload == nil {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "payload required"))
+	}
+	var p types.DrawnSwap
+	if err := tinyjson.Unmarshal([]byte(*payload), &p); err != nil {
+		ce.CustomAbort(ce.WrapContractError(ce.ErrJson, err, "invalid payload"))
+	}
+	instruction := p.Instruction
+	validateInstruction(&instruction, env.ContractId)
+	if instruction.AssetIn == "" || instruction.AssetOut == "" {
+		ce.CustomAbort(ce.NewContractError(ce.ErrInput, "swap requires asset_in and asset_out"))
+	}
+	return executeSwap(instruction, swapCtx{user: p.User, refundTo: p.RefundTo, drawn: true,
+		returnAsset: strings.ToLower(instruction.AssetIn)})
+}
+
+// returnSlipBps is how far below the swap's own rate a failed payout's swap
+// back may fill (the pool fee both ways, a price move while the payout was out):
+// the floor the bridge keeps for the first day it holds the return, while its
+// bot swaps it back at today's price; the value is never credited on Magi.
+const returnSlipBps = 500
+
+// logSafe keeps a reason inside one log field: no '|' and at most 160 bytes.
+func logSafe(s string) string {
+	s = strings.ReplaceAll(s, "|", "/")
+	if len(s) > 160 {
+		s = s[:160]
+	}
+	return s
+}
+
 // Execute swap operation with 2-step routing
-func executeSwap(instruction types.DexInstruction) *string {
+func executeSwap(instruction types.DexInstruction, ctx swapCtx) *string {
 	// Normalize once — all downstream functions expect lowercase
 	instruction.AssetIn = strings.ToLower(instruction.AssetIn)
 	instruction.AssetOut = strings.ToLower(instruction.AssetOut)
@@ -337,13 +456,13 @@ func executeSwap(instruction types.DexInstruction) *string {
 	// Try direct pool first
 	directPoolId := findPool(instruction.AssetIn, instruction.AssetOut)
 	if directPoolId != "" {
-		return executeDirectSwap(directPoolId, instruction)
+		return executeDirectSwap(directPoolId, instruction, ctx)
 	}
 
 	// Try two-hop swap via HBD
 	hbd := sdk.AssetHbd.String()
 	if instruction.AssetIn != hbd && instruction.AssetOut != hbd {
-		return executeTwoHopSwap(instruction)
+		return executeTwoHopSwap(instruction, ctx)
 	}
 
 	ce.CustomAbort(
@@ -366,13 +485,13 @@ func findPool(assetA, assetB string) string {
 }
 
 // Execute direct swap within a single DEX pool
-func executeDirectSwap(dexContractId string, instruction types.DexInstruction) *string {
+func executeDirectSwap(dexContractId string, instruction types.DexInstruction, ctx swapCtx) *string {
 	env := sdk.GetEnv()
-	userAddr := env.Caller.String()
+	userAddr := ctx.user
 	contractAccId := "contract:" + env.ContractId
 
 	// Pre-fund input asset into the pool (mapped via transferFrom, native via HiveDraw+HiveTransfer).
-	err := preFundAsset(instruction.AssetIn, instruction.AmountIn, dexContractId, &env)
+	err := preFundAsset(instruction.AssetIn, instruction.AmountIn, dexContractId, &env, ctx.drawn)
 	if err != nil {
 		ce.CustomAbort(ce.Prepend(err, "error pre-funding asset to dex"))
 	}
@@ -426,7 +545,10 @@ func executeDirectSwap(dexContractId string, instruction types.DexInstruction) *
 			instruction.Recipient,
 			instruction.DestinationChain,
 			instruction.MaxFee,
-			settlementRefundTo(instruction, userAddr),
+			ctx.refundTo,
+			ctx.returnAsset,
+			instruction.AmountIn,
+			instruction.PayoutGasLimit,
 		)
 	}
 
@@ -435,7 +557,7 @@ func executeDirectSwap(dexContractId string, instruction types.DexInstruction) *
 
 // Execute two-hop swap via HBD using ERC-20 allowances for mapped assets
 // and protocol-level intents for native assets (HBD between hops).
-func executeTwoHopSwap(instruction types.DexInstruction) *string {
+func executeTwoHopSwap(instruction types.DexInstruction, ctx swapCtx) *string {
 	pool1Id := findPool(instruction.AssetIn, sdk.AssetHbd.String())
 	if pool1Id == "" {
 		ce.CustomAbort(ce.NewContractError(ce.ErrInitialization, "no pool found for first hop"))
@@ -449,11 +571,11 @@ func executeTwoHopSwap(instruction types.DexInstruction) *string {
 	var mEnv types.MaybeEnv
 	env := mEnv.UseEnv()
 	contractAccId := "contract:" + env.ContractId
-	userAddr := env.Caller.String()
+	userAddr := ctx.user
 
 	// --- First hop: AssetIn → HBD ---
 	// Pre-fund input asset into pool1 (mapped via transferFrom, native via HiveDraw+HiveTransfer).
-	err := preFundAsset(instruction.AssetIn, instruction.AmountIn, pool1Id, env)
+	err := preFundAsset(instruction.AssetIn, instruction.AmountIn, pool1Id, env, ctx.drawn)
 	if err != nil {
 		ce.CustomAbort(ce.Prepend(err, "error pre-funding asset to dex"))
 	}
@@ -549,11 +671,38 @@ func executeTwoHopSwap(instruction types.DexInstruction) *string {
 			instruction.Recipient,
 			instruction.DestinationChain,
 			instruction.MaxFee,
-			settlementRefundTo(instruction, userAddr),
+			ctx.refundTo,
+			ctx.returnAsset,
+			instruction.AmountIn,
+			instruction.PayoutGasLimit,
 		)
 	}
 
 	return secondResult
+}
+
+// settlementReturn is who gets an EVM payout that comes back after the swap,
+// and the asset it is swapped back to first ("": none, credited as is).
+//
+// SENDER-REFUND-1: a deposit swap paid with Bitcoin names its sender with
+// return_address {chain: BTC, address: did:pkh:bip122:...}: a payout that comes
+// back is swapped back to BTC and paid to that address on Bitcoin (THORChain's
+// reverse swap to the inbound asset and sender). A Bitcoin wallet account
+// paying BTC from its Magi balance gets the same, as it has no RC to move a
+// refund on Magi itself.
+func settlementReturn(instruction types.DexInstruction, caller string) (string, string) {
+	btcIn := strings.EqualFold(instruction.AssetIn, "btc")
+	if ra := instruction.ReturnAddress; ra != nil && strings.EqualFold(strings.TrimSpace(ra.Chain), chainBTC) {
+		if !btcIn || sdk.VerifyAddress(ra.Address) != "user:btc" {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput,
+				"return_address on BTC needs a BTC input and a Bitcoin identity (did:pkh:bip122)"))
+		}
+		return ra.Address, "btc"
+	}
+	if instruction.ReturnAddress == nil && btcIn && sdk.VerifyAddress(caller) == "user:btc" {
+		return caller, "btc"
+	}
+	return settlementRefundTo(instruction, caller), ""
 }
 
 // settlementRefundTo is who gets a settlement back if the payout fails after the
@@ -582,7 +731,14 @@ func settlementRefundTo(instruction types.DexInstruction, caller string) string 
 // For Ethereum assets: the EVM bridge's unmapETH / unmapERC20 (settleToEVM).
 // For other mapped assets (BTC, LTC, ...): calls "unmap" on the mapping contract.
 // refundTo is the router's caller: a refund of the withdrawal is theirs.
-func settleToChain(asset string, amount *big.Int, toAddress string, chain string, maxFee *int64, refundTo string) {
+// returnAsset (a swap paid from Hive) is what an EVM payout that reverts later
+// is swapped back to, for refundTo on Hive.
+//
+// returnIn is what the trader paid in returnAsset (amount_in), for the floor
+// of that swap back.
+//
+// payoutGasLimit is an ETH payout's L1 gas limit (0: the bridge's default).
+func settleToChain(asset string, amount *big.Int, toAddress string, chain string, maxFee *int64, refundTo, returnAsset, returnIn string, payoutGasLimit uint64) {
 	assetLower := strings.ToLower(asset)
 
 	// DX-H4: the requested settlement chain was previously IGNORED — the
@@ -616,7 +772,7 @@ func settleToChain(asset string, amount *big.Int, toAddress string, chain string
 		)
 	}
 	if strings.EqualFold(chain, "ETH") {
-		settleToEVM(mappingContract, assetLower, amount, toAddress, maxFee, refundTo)
+		settleToEVM(mappingContract, assetLower, amount, toAddress, maxFee, refundTo, returnAsset, returnIn, payoutGasLimit)
 		return
 	}
 
@@ -645,7 +801,12 @@ func settleToChain(asset string, amount *big.Int, toAddress string, chain string
 // what it withdraws, so the router withdraws the output less that fee (the
 // THORChain outbound fee rule: it comes out of what is sent). refund_to names
 // the caller: a refund credited to the router could never leave it.
-func settleToEVM(bridge, asset string, amount *big.Int, to string, maxFee *int64, refundTo string) {
+func settleToEVM(bridge, asset string, amount *big.Int, to string, maxFee *int64, refundTo, returnAsset, returnIn string, gasLimit uint64) {
+	// An Ethereum identity (did:pkh:eip155:<chain>:0x...) is paid at its address:
+	// a deposit swap paid with Bitcoin names its recipient as a Magi identity.
+	if strings.HasPrefix(to, "did:pkh:eip155:") {
+		to = to[strings.LastIndex(to, ":")+1:]
+	}
 	infoResult := sdk.ContractCall(bridge, "getInfo", `{"symbol":"`+asset+`"}`, nil)
 	if infoResult == nil {
 		ce.CustomAbort(ce.NewContractError(ce.ErrTransaction, "failed to query getInfo on the EVM bridge for "+asset))
@@ -668,7 +829,23 @@ func settleToEVM(bridge, asset string, amount *big.Int, to string, maxFee *int64
 		ce.CustomAbort(ce.NewContractError(ce.ErrTransaction,
 			"swap output "+amount.String()+" does not cover the EVM bridge's proof fee "+fee.String()))
 	}
-	params := types.EvmUnmapParams{Amount: net.String(), To: to, Asset: asset, RefundTo: refundTo}
+	params := types.EvmUnmapParams{Amount: net.String(), To: to, Asset: asset, RefundTo: refundTo, ReturnAsset: returnAsset}
+	if returnAsset != "" {
+		// The swap back of a reverted payout runs when any relayer submits the
+		// revert, so it gets a floor: the trader's input at this swap's own rate
+		// for what is withdrawn, less returnSlipBps.
+		in, ok := new(big.Int).SetString(returnIn, 10)
+		if !ok || in.Sign() <= 0 {
+			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "invalid amount_in for the return floor"))
+		}
+		min := new(big.Int).Mul(in, net)
+		min.Mul(min, big.NewInt(10_000-returnSlipBps))
+		min.Div(min, new(big.Int).Mul(amount, big.NewInt(10_000)))
+		if min.Sign() <= 0 {
+			min.SetInt64(1)
+		}
+		params.ReturnMin = min.String()
+	}
 	if maxFee != nil {
 		if *maxFee <= 0 {
 			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "max_fee must be positive"))
@@ -678,6 +855,7 @@ func settleToEVM(bridge, asset string, amount *big.Int, to string, maxFee *int64
 	action := "unmapETH"
 	if asset == "eth" {
 		params.DeductFee = true
+		params.GasLimit = gasLimit // the bridge checks its bounds
 	} else {
 		if info.TokenAddress == "" {
 			ce.CustomAbort(ce.NewContractError(ce.ErrTransaction, "the EVM bridge gave no token address for "+asset))
@@ -698,8 +876,20 @@ func settleToEVM(bridge, asset string, amount *big.Int, to string, maxFee *int64
 // For mapped assets: calls transferFrom on the mapping contract (user → pool).
 // For native assets: draws from user into router, then transfers to pool.
 // Returns true (asset is pre-deposited in the pool, pool should skip DrawAssetFrom).
-func preFundAsset(asset string, amount string, toPool string, env *sdk.Env) error {
+// drawn: the input is already on the router (swap_drawn); it is moved to the pool.
+func preFundAsset(asset string, amount string, toPool string, env *sdk.Env, drawn bool) error {
 	mappingContract := getMappingContract(strings.ToLower(asset))
+	if drawn {
+		if mappingContract != "" {
+			return ce.NewContractError(ce.ErrInput, "a drawn swap's input must be HIVE or HBD")
+		}
+		amt, ok := new(big.Int).SetString(amount, 10)
+		if !ok || amt.Sign() <= 0 {
+			return ce.NewContractError(ce.ErrInput, "amount must be positive")
+		}
+		sdk.HiveTransfer(sdk.Address("contract:"+toPool), amt, sdk.Asset(strings.ToLower(asset)))
+		return nil
+	}
 	if mappingContract != "" {
 		// Mapped asset: transfer via ERC-20 allowance (user → pool).
 		input := types.MappingContractInput{
@@ -751,11 +941,11 @@ func executeDeposit(instruction types.DexInstruction) *string {
 	// Pre-fund both assets into the pool.
 	// Asset0/Asset1 match pool ordering, so Amount0 funds pool.asset0 and Amount1 funds pool.asset1.
 	env := sdk.GetEnv()
-	err := preFundAsset(instruction.Asset0, instruction.Amount0, poolId, &env)
+	err := preFundAsset(instruction.Asset0, instruction.Amount0, poolId, &env, false)
 	if err != nil {
 		ce.CustomAbort(ce.Prepend(err, "error pre-funding asset0 to dex"))
 	}
-	err = preFundAsset(instruction.Asset1, instruction.Amount1, poolId, &env)
+	err = preFundAsset(instruction.Asset1, instruction.Amount1, poolId, &env, false)
 	if err != nil {
 		ce.CustomAbort(ce.Prepend(err, "error pre-funding asset1 to dex"))
 	}

@@ -219,6 +219,43 @@ func TestSP0b_RouterRegistersAndRoutesUsdc(t *testing.T) {
 // output less the bridge's proof fee, and names the trader as refund_to, so a
 // refund (here: the trader cancels the queued withdrawal) reaches the trader
 // and not the router, which could never move it.
+func TestSP0c_EthereumIdentityRecipientIsPaidAtItsAddress(t *testing.T) {
+	// SENDER-REFUND-1: a deposit swap paid with Bitcoin names its Ethereum
+	// recipient as a Magi identity (the BTC contract requires a user address);
+	// the bridge pays the bare 0x address.
+	ct := setupUsdcHbdPool(t)
+	router := &RouterInfo{ct: &ct, id: usdcRouter}
+	r := router.initRouterV2(t, usdcOwner)
+	require.True(t, r.Success, "init router: %s: %s", r.Err, r.ErrMsg)
+	ref := "11155111-1c7d4b196cb0c7b01d743fbc6116a902379c7238"
+	ct.StateSet(evmBridgeId, "ts-usdc", ref)
+	ct.StateSet(evmBridgeId, "t-"+ref, "usdc|6|1")
+	ct.StateSet(evmBridgeId, "pf-usdc", "150000")   // 0.15 USDC proof fee
+	ct.StateSet(evmBridgeId, "chainid", "11155111") // the bridge's own chain (Sepolia), as registered
+	r = router.registerToken(t, usdcOwner, types.RegisterTokenParams{Name: "HBD", TokenInfo: types.TokenInfo{Chain: "HIVE"}})
+	require.True(t, r.Success, "register hbd: %s: %s", r.Err, r.ErrMsg)
+	regPayload, _ := tinyjson.Marshal(types.RegisterTokenParams{Name: "usdc", TokenInfo: types.TokenInfo{Chain: "ETH", MappingContract: evmBridgeId}})
+	reg := ct.Call(state_engine.TxVscCallContract{
+		Self: *basicSelf(t, usdcOwner), ContractId: usdcRouter, Action: "register_token", Payload: regPayload,
+		RcLimit: usdcRcLimit, Intents: []contracts.Intent{}, Caller: usdcOwner,
+	})
+	require.True(t, reg.Success, "register usdc: %s: %s", reg.Err, reg.ErrMsg)
+	r = router.registerPool(t, usdcOwner, types.RegisterPoolParams{Asset0: "hbd", Asset1: "usdc", DexContractId: usdcPoolId})
+	require.True(t, r.Success, "register pool: %s: %s", r.Err, r.ErrMsg)
+
+	const l1To = "0x00000000000000000000000000000000000000e2"
+	ct.Deposit(usdcTrader, 1_000+rcHeadroomHBD, ledger_db.Asset("hbd"))
+	maxFee := int64(3_000_000_000_000_000)
+	r = router.execute(t, usdcTrader, &types.DexInstruction{
+		Type: "swap", Version: "1.0.0", AssetIn: "hbd", AssetOut: "usdc", AmountIn: "1000",
+		Recipient: "did:pkh:eip155:1:" + l1To, DestinationChain: "ETH", MaxFee: &maxFee,
+	}, []contracts.Intent{{Type: "transfer.allow", Args: map[string]string{"token": "hbd", "limit": "1000"}}})
+	require.True(t, r.Success, "routed to an Ethereum identity: %s: %s", r.Err, r.ErrMsg)
+	var q struct{ To string }
+	require.NoError(t, json.Unmarshal([]byte(ct.StateGet(evmBridgeId, "wq-0")), &q), ct.StateGet(evmBridgeId, "wq-0"))
+	require.Equal(t, l1To, q.To, "paid at the identity's address")
+}
+
 func TestSP0c_RouterSettlesUsdcToEthereum(t *testing.T) {
 	ct := setupUsdcHbdPool(t)
 	router := &RouterInfo{ct: &ct, id: usdcRouter}

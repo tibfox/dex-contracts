@@ -23,6 +23,7 @@ const (
 // Supported chains for native tokens (HIVE for HIVE/HBD, MAGI for future MAGI native tokens)
 const (
 	chainHIVE = "HIVE"
+	chainBTC  = "BTC"
 	chainMAGI = "MAGI"
 )
 

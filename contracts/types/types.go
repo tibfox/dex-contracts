@@ -174,6 +174,17 @@ type ReturnAddress struct {
 	Address string `json:"address"`
 }
 
+// DrawnSwap is the router's call to itself (swap_drawn) for a swap whose input
+// it already drew from the trader: a swap with return_address on HIVE. User is
+// the trader, RefundTo who gets a failed later payout back.
+//
+//tinyjson:json
+type DrawnSwap struct {
+	Instruction DexInstruction `json:"instruction"`
+	User        string         `json:"user"`
+	RefundTo    string         `json:"refund_to"`
+}
+
 // ROUTER TYPES
 //
 // DexInstruction is a union type dispatched on the Type field:
@@ -222,6 +233,10 @@ type DexInstruction struct {
 	// When set to a non-MAGI chain, the router bridges swap output to the Recipient
 	// address on that chain instead of settling on Magi.
 	DestinationChain string `json:"destination_chain,omitempty"`
+	// PayoutGasLimit (an ETH payout only): the L1 gas limit the client sized for
+	// this recipient (its estimate plus a margin); the bridge charges those
+	// units. 0 = the bridge's default.
+	PayoutGasLimit uint64 `json:"payout_gas_limit,omitempty"`
 	// MaxFee caps the unmap fee charged when settling a *mapped* asset (BTC,
 	// ETH, etc.) to its native chain: it is threaded into UnmapParams.MaxFee
 	// so the mapping contract rejects the unmap if its fee exceeds this cap.
@@ -289,4 +304,14 @@ type EvmUnmapParams struct {
 	DeductFee    bool   `json:"deduct_fee,omitempty"`
 	MaxFee       string `json:"max_fee,omitempty"`
 	RefundTo     string `json:"refund_to,omitempty"`
+	// ReturnAsset: the HIVE or HBD a swap paid from Hive was paid with. If the
+	// withdrawal reverts on L1, the bridge swaps the refund back to it and sends
+	// it to refund_to on Hive instead of crediting a Magi balance.
+	ReturnAsset string `json:"return_asset,omitempty"`
+	// ReturnMin: the least of ReturnAsset a refund of the whole withdrawal must
+	// swap back to (the swap's own rate less returnSlipBps).
+	ReturnMin string `json:"return_min,omitempty"`
+	// GasLimit (ETH only): the payout's L1 gas limit; the bridge charges its
+	// units. 0 = the bridge's default (egl).
+	GasLimit uint64 `json:"gas_limit,omitempty"`
 }
