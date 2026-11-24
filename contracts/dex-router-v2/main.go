@@ -424,10 +424,100 @@ func SwapDrawn(payload *string) *string {
 }
 
 // returnSlipBps is how far below the swap's own rate a failed payout's swap
-// back may fill (the pool fee both ways, a price move while the payout was out):
-// the floor the bridge keeps for the first day it holds the return, while its
-// bot swaps it back at today's price; the value is never credited on Magi.
+// back may fill (a price move while the payout was out): the floor the bridge
+// keeps for the first day it holds the return, while its bot swaps it back at
+// today's price; the value is never credited on Magi.
+//
+// It is the allowance for the PRICE MOVING. The pool's own round-trip cost is
+// measured separately and allowed for on top of it (returnFloor) — charging
+// that to the floor is what made the floor unfillable; see settleToEVM.
 const returnSlipBps = 500
+
+// returnFloor carries what the router measured about the swap it is settling,
+// so a failed payout's return floor can allow for the pool's OWN round-trip
+// cost instead of treating it as a skim.
+type returnFloor struct {
+	// slipNum/slipDen is the slip proportion one leg pays: the leg's input over
+	// the input-side reserve after it.
+	slipNum *big.Int
+	slipDen *big.Int
+	// legs is how many legs the value travels to get back to the sender: the
+	// forward hops it already made, plus the same hops in reverse.
+	legs int
+}
+
+// newReturnFloor measures the slip a swap leg just paid, as the leg's input
+// over the input-side reserve AFTER it.
+//
+// This needs no fee math and makes no curve assumption. A constant-product
+// pool's input reserve grows by exactly the input, and THORChain's slip fee is
+// grossOut*x/(x+X) (modules/incentive-pendulum.SlipFee), so x/(x+X) IS the
+// proportion the pool took. A stable pool slips LESS than that, and so does
+// the pre-parity fee math with its 1% clamp, so the measurement overstates the
+// cost in both of those cases — which moves the floor DOWN. That is the safe
+// direction: a floor slightly too low still leaves returnSlipBps of anti-skim
+// margin, while a floor too high strands the sender's refund for a whole day
+// (the bridge's PayoutFloorFor).
+//
+// Returns a zero returnFloor (no allowance, the old behaviour) when the pool
+// state does not name the input asset or the reserve is not readable, so a
+// pool shape this does not understand cannot widen the floor by accident.
+func newReturnFloor(pool types.PoolInfo, assetIn string, amountIn *big.Int, legs int) returnFloor {
+	if amountIn == nil || amountIn.Sign() <= 0 || legs <= 0 {
+		return returnFloor{}
+	}
+	reserve := ""
+	switch strings.ToLower(assetIn) {
+	case strings.ToLower(pool.Asset0):
+		reserve = pool.Reserve0
+	case strings.ToLower(pool.Asset1):
+		reserve = pool.Reserve1
+	default:
+		return returnFloor{}
+	}
+	den, ok := new(big.Int).SetString(reserve, 10)
+	if !ok || den.Sign() <= 0 || den.Cmp(amountIn) <= 0 {
+		return returnFloor{}
+	}
+	return returnFloor{slipNum: new(big.Int).Set(amountIn), slipDen: den, legs: legs}
+}
+
+// returnMin is the floor a held payout's swap back must fill: what the trader
+// paid, valued at this swap's own rate for what is actually withdrawn, less the
+// pool's own round-trip cost (floor) and less returnSlipBps for the price
+// moving while the payout was out.
+//
+//	in     what the trader paid in the return asset (amount_in)
+//	net    what is withdrawn on L1 (the swap's output less the proving fee)
+//	amount the swap's gross output, so net/amount is the rate in/out
+//
+// Never 0: a floor of 0 would let any relayer swap the return back at any price.
+// Extracted from settleToEVM so the arithmetic can be pinned by a test without
+// a devnet (return_floor_test.go).
+func returnMin(in, net, amount *big.Int, floor returnFloor) *big.Int {
+	num := new(big.Int).Mul(in, net)
+	num.Mul(num, big.NewInt(10_000-returnSlipBps))
+	den := new(big.Int).Mul(amount, big.NewInt(10_000))
+	floor.keepNumDen(num, den)
+	min := num.Div(num, den)
+	if min.Sign() <= 0 {
+		min.SetInt64(1)
+	}
+	return min
+}
+
+// keepNumDen multiplies num/den by (1 - slip) once per leg.
+func (f returnFloor) keepNumDen(num, den *big.Int) {
+	if f.slipNum == nil || f.slipDen == nil || f.slipNum.Sign() <= 0 ||
+		f.slipDen.Sign() <= 0 || f.slipNum.Cmp(f.slipDen) >= 0 {
+		return
+	}
+	keep := new(big.Int).Sub(f.slipDen, f.slipNum)
+	for i := 0; i < f.legs; i++ {
+		num.Mul(num, keep)
+		den.Mul(den, f.slipDen)
+	}
+}
 
 // logSafe keeps a reason inside one log field: no '|' and at most 160 bytes.
 func logSafe(s string) string {
@@ -539,6 +629,9 @@ func executeDirectSwap(dexContractId string, instruction types.DexInstruction, c
 		if !ok || amountOut.Sign() <= 0 {
 			ce.CustomAbort(ce.NewContractError(ce.ErrTransaction, "swap returned invalid amount out"))
 		}
+		// nil when it does not parse; newReturnFloor then allows nothing, which
+		// is the pre-2026-11-23 floor.
+		legIn, _ := new(big.Int).SetString(instruction.AmountIn, 10)
 		settleToChain(
 			instruction.AssetOut,
 			amountOut,
@@ -549,6 +642,8 @@ func executeDirectSwap(dexContractId string, instruction types.DexInstruction, c
 			ctx.returnAsset,
 			instruction.AmountIn,
 			instruction.PayoutGasLimit,
+			// One pool, so the value travels two legs to come back: out and back.
+			newReturnFloor(swapResult.PoolState, instruction.AssetIn, legIn, 2),
 		)
 	}
 
@@ -675,6 +770,12 @@ func executeTwoHopSwap(instruction types.DexInstruction, ctx swapCtx) *string {
 			ctx.returnAsset,
 			instruction.AmountIn,
 			instruction.PayoutGasLimit,
+			// Two pools, so four legs. The slip is measured on the second hop,
+			// the only pool state this frame has; a first hop that is thinner
+			// than the second still gets a floor that is too high, which is an
+			// improvement on one that ignores the round trip altogether but not
+			// a complete fix for the two-hop case.
+			newReturnFloor(swapResult2.PoolState, sdk.AssetHbd.String(), res1AmountOut, 4),
 		)
 	}
 
@@ -738,7 +839,7 @@ func settlementRefundTo(instruction types.DexInstruction, caller string) string 
 // of that swap back.
 //
 // payoutGasLimit is an ETH payout's L1 gas limit (0: the bridge's default).
-func settleToChain(asset string, amount *big.Int, toAddress string, chain string, maxFee *int64, refundTo, returnAsset, returnIn string, payoutGasLimit uint64) {
+func settleToChain(asset string, amount *big.Int, toAddress string, chain string, maxFee *int64, refundTo, returnAsset, returnIn string, payoutGasLimit uint64, floor returnFloor) {
 	assetLower := strings.ToLower(asset)
 
 	// DX-H4: the requested settlement chain was previously IGNORED — the
@@ -772,7 +873,7 @@ func settleToChain(asset string, amount *big.Int, toAddress string, chain string
 		)
 	}
 	if strings.EqualFold(chain, "ETH") {
-		settleToEVM(mappingContract, assetLower, amount, toAddress, maxFee, refundTo, returnAsset, returnIn, payoutGasLimit)
+		settleToEVM(mappingContract, assetLower, amount, toAddress, maxFee, refundTo, returnAsset, returnIn, payoutGasLimit, floor)
 		return
 	}
 
@@ -801,7 +902,7 @@ func settleToChain(asset string, amount *big.Int, toAddress string, chain string
 // what it withdraws, so the router withdraws the output less that fee (the
 // THORChain outbound fee rule: it comes out of what is sent). refund_to names
 // the caller: a refund credited to the router could never leave it.
-func settleToEVM(bridge, asset string, amount *big.Int, to string, maxFee *int64, refundTo, returnAsset, returnIn string, gasLimit uint64) {
+func settleToEVM(bridge, asset string, amount *big.Int, to string, maxFee *int64, refundTo, returnAsset, returnIn string, gasLimit uint64, floor returnFloor) {
 	// An Ethereum identity (did:pkh:eip155:<chain>:0x...) is paid at its address:
 	// a deposit swap paid with Bitcoin names its recipient as a Magi identity.
 	if strings.HasPrefix(to, "did:pkh:eip155:") {
@@ -833,18 +934,31 @@ func settleToEVM(bridge, asset string, amount *big.Int, to string, maxFee *int64
 	if returnAsset != "" {
 		// The swap back of a reverted payout runs when any relayer submits the
 		// revert, so it gets a floor: the trader's input at this swap's own rate
-		// for what is withdrawn, less returnSlipBps.
+		// for what is withdrawn, less the pool's own round-trip cost, less
+		// returnSlipBps for the price moving.
+		//
+		// The round-trip allowance is not a nicety: without it this floor is one
+		// NO honest pool can fill. The trader's input is a PRE-slip number, and
+		// the value has to cross the pool twice to get back to them, so anchoring
+		// on it alone charges the sender for the pool's own fee twice and calls
+		// the shortfall a skim. With the slip fee live
+		// (ConsensusParams.PendulumSlipParityHeight, which drops the 1% clamp the
+		// old fee math had) a swap worth a few percent of a pool's depth pays
+		// that slip on the way out AND on the way back: 2 HBD against 50 HBD of
+		// depth cost 7.67% to round-trip while this floor allowed 5.00%.
+		//
+		// Devnet SWAP-SAFETY S8, 2026-11-23: every dry run came back "the swap
+		// back did not run: reverted: slippage tolerance exceeded", the bot's
+		// retry backoff doubled out to 16 minutes, and the sender's 2 HBD stayed
+		// in the hold — not because anyone skimmed it, but because the floor was
+		// unreachable the moment it was written, and the bridge holds it flat for
+		// PayoutFloorFor (a day) before it starts to decay. It cleared only when
+		// an unrelated swap happened to move the pool the favourable way.
 		in, ok := new(big.Int).SetString(returnIn, 10)
 		if !ok || in.Sign() <= 0 {
 			ce.CustomAbort(ce.NewContractError(ce.ErrInput, "invalid amount_in for the return floor"))
 		}
-		min := new(big.Int).Mul(in, net)
-		min.Mul(min, big.NewInt(10_000-returnSlipBps))
-		min.Div(min, new(big.Int).Mul(amount, big.NewInt(10_000)))
-		if min.Sign() <= 0 {
-			min.SetInt64(1)
-		}
-		params.ReturnMin = min.String()
+		params.ReturnMin = returnMin(in, net, amount, floor).String()
 	}
 	if maxFee != nil {
 		if *maxFee <= 0 {
